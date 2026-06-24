@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import Board from './Board';
 
@@ -7,7 +7,7 @@ import Board from './Board';
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ||
   (import.meta.env.PROD ? window.location.origin : `http://${window.location.hostname}:3001`);
 
-export default function MultiplayerGame({ onBackToMenu }) {
+export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) {
   const [socket, setSocket] = useState(null);
   const [roomCode, setRoomCode] = useState('');
   const [playerSymbol, setPlayerSymbol] = useState('');
@@ -24,6 +24,19 @@ export default function MultiplayerGame({ onBackToMenu }) {
   const [opponentName, setOpponentName] = useState('');
   const [showNamePrompt, setShowNamePrompt] = useState(false);
   const [scores, setScores] = useState({ X: 0, O: 0 });
+  const [inviteCopied, setInviteCopied] = useState(false);
+  // A dedicated error for people who arrived via an invite link (room full /
+  // not found). Kept separate from `error` so we can show a friendly screen
+  // instead of dumping them into the Create/Join lobby.
+  const [linkError, setLinkError] = useState('');
+
+  // Refs (not state) because we read them inside the socket effect, whose
+  // closure is created once. `joinedViaLinkRef` makes the auto-join fire exactly
+  // once even though React 18 StrictMode mounts the effect twice in dev.
+  const joinedViaLinkRef = useRef(false);
+  // A live mirror of `gameStarted` so the error handler can tell whether a
+  // failure happened before play began without reading a stale state value.
+  const gameStartedRef = useRef(false);
 
   useEffect(() => {
     const newSocket = io(SOCKET_URL);
@@ -31,6 +44,15 @@ export default function MultiplayerGame({ onBackToMenu }) {
 
     newSocket.on('connect', () => {
       console.log('Connected to server');
+
+      // Auto-join when the page was opened from an invite link. We emit on the
+      // local `newSocket` (guaranteed live here) rather than the `socket` state,
+      // which may still be null on first render. The ref guard ensures we only
+      // emit once even if StrictMode runs this effect twice in dev.
+      if (initialRoomCode && !joinedViaLinkRef.current) {
+        joinedViaLinkRef.current = true;
+        newSocket.emit('joinRoom', initialRoomCode);
+      }
     });
 
     newSocket.on('roomCreated', ({ roomCode, playerSymbol, playerId }) => {
@@ -48,9 +70,17 @@ export default function MultiplayerGame({ onBackToMenu }) {
       setPlayerId(playerId);
       setShowNamePrompt(true);
       setError('');
+
+      // Now that we're safely in the room, strip ?room= from the address bar so
+      // a refresh lands on the normal menu instead of trying to re-join a room
+      // that may now be full.
+      if (window.location.search) {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
     });
 
     newSocket.on('gameStart', ({ squares, xIsNext }) => {
+      gameStartedRef.current = true;
       setGameStarted(true);
       setWaitingForOpponent(false);
       setSquares(squares);
@@ -71,7 +101,14 @@ export default function MultiplayerGame({ onBackToMenu }) {
     });
 
     newSocket.on('error', (message) => {
-      setError(message);
+      // If someone arrived via an invite link and the game never started, the
+      // only errors they can hit are "Room not found" / "Room is full". Show a
+      // friendly full-screen message instead of the generic lobby error.
+      if (initialRoomCode && !gameStartedRef.current) {
+        setLinkError(message);
+      } else {
+        setError(message);
+      }
     });
 
     newSocket.on('opponentName', (name) => {
@@ -146,7 +183,41 @@ export default function MultiplayerGame({ onBackToMenu }) {
     setTimeout(() => setShowCopied(false), 2000);
   };
 
+  // Build the full invite link that gets shared on WhatsApp. `window.location.origin`
+  // is the site's base URL (no trailing slash) — "http://localhost:5173" in dev and
+  // the real ".onrender.com" address once deployed — so the same code works in both.
+  const buildInviteLink = () => `${window.location.origin}/?room=${roomCode}`;
+
+  const copyInviteLink = () => {
+    navigator.clipboard.writeText(buildInviteLink());
+    setInviteCopied(true);
+    setTimeout(() => setInviteCopied(false), 2000);
+  };
+
   const isMyTurn = (xIsNext && playerSymbol === 'X') || (!xIsNext && playerSymbol === 'O');
+
+  // Invite-link failure view — shown when someone follows a link to a room that
+  // is full or no longer exists. Takes priority over the lobby so they never see
+  // the Create/Join UI they didn't ask for.
+  if (linkError) {
+    return (
+      <div className="multiplayer-lobby">
+        <div className="lobby">
+          <div className="lobby-header">
+            <h1>Room unavailable</h1>
+          </div>
+          <p className="modal-message">
+            {linkError === 'Room is full'
+              ? 'This game already has two players.'
+              : "This invite link isn't valid anymore."}
+          </p>
+          <button className="lobby-button create-button" onClick={onBackToMenu}>
+            Go to Menu
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // Lobby view
   if (!roomCode) {
@@ -209,7 +280,7 @@ export default function MultiplayerGame({ onBackToMenu }) {
             autoFocus
           />
           <button className="modal-button" onClick={submitName}>
-            Continue
+            Start Game
           </button>
         </div>
       </div>
@@ -272,7 +343,10 @@ export default function MultiplayerGame({ onBackToMenu }) {
         <div className="waiting-message">
           <div className="spinner"></div>
           <p>Waiting for opponent to join...</p>
-          <p className="room-code-hint">Share room code: <strong>{roomCode}</strong></p>
+          <button className="copy-button" onClick={copyInviteLink}>
+            {inviteCopied ? '✓ Link Copied!' : '🔗 Copy Invite Link'}
+          </button>
+          <p className="room-code-hint">Or share room code: <strong>{roomCode}</strong></p>
         </div>
       )}
 
