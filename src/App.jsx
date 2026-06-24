@@ -4,7 +4,15 @@ import MultiplayerGame from './MultiplayerGame';
 import './App.css';
 
 export default function App() {
-  const [gameMode, setGameMode] = useState('menu'); // 'menu', 'local', 'multiplayer'
+  // If the page was opened via an invite link (e.g. /?room=ABC123), grab the
+  // room code once on first render. The lazy initializer runs a single time, so
+  // we never re-parse the URL on every re-render.
+  const [initialRoomCode] = useState(() => {
+    const code = new URLSearchParams(window.location.search).get('room');
+    return code ? code.toUpperCase().trim() : '';
+  });
+  // Invitees skip the menu entirely and drop straight into multiplayer.
+  const [gameMode, setGameMode] = useState(initialRoomCode ? 'multiplayer' : 'menu'); // 'menu', 'local', 'multiplayer'
   const [history, setHistory] = useState([Array(9).fill(null)]);
   const [currentMove, setCurrentMove] = useState(0);
   const xIsNext = currentMove % 2 === 0;
@@ -59,7 +67,7 @@ export default function App() {
 
   // Multiplayer mode
   if (gameMode === 'multiplayer') {
-    return <MultiplayerGame onBackToMenu={backToMenu} />;
+    return <MultiplayerGame onBackToMenu={backToMenu} initialRoomCode={initialRoomCode} />;
   }
 
   // Local game mode
