@@ -1,14 +1,26 @@
 import { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import Board from './Board';
+import Connect4Board from './Connect4Board';
+
+// Display labels keyed by game type. The room creator picks the game; joiners
+// (including invite-link arrivals) learn it from the server.
+const GAME_LABELS = {
+  tictactoe: 'Tic Tac Toe',
+  connect4: 'Connect 4',
+};
 
 // In production (Render), frontend and backend are on same server
 // In development, use env variable or localhost:3001
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ||
   (import.meta.env.PROD ? window.location.origin : `http://${window.location.hostname}:3001`);
 
-export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) {
+export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '', initialGameType = 'tictactoe' }) {
   const [socket, setSocket] = useState(null);
+  // The creator's choice seeds this; the server is the source of truth and
+  // overrides it on roomCreated/roomJoined/gameStart (so invite-link joiners
+  // render the right game even though it isn't in the URL).
+  const [gameType, setGameType] = useState(initialGameType || 'tictactoe');
   const [roomCode, setRoomCode] = useState('');
   const [playerSymbol, setPlayerSymbol] = useState('');
   const [playerId, setPlayerId] = useState('');
@@ -37,6 +49,10 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
   // A live mirror of `gameStarted` so the error handler can tell whether a
   // failure happened before play began without reading a stale state value.
   const gameStartedRef = useRef(false);
+  // Live mirrors of our seat, read inside the once-created socket effect so a
+  // reconnect can re-claim it (the connect handler closure can't see state).
+  const roomCodeRef = useRef('');
+  const playerSymbolRef = useRef('');
 
   useEffect(() => {
     const newSocket = io(SOCKET_URL);
@@ -45,29 +61,43 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
     newSocket.on('connect', () => {
       console.log('Connected to server');
 
-      // Auto-join when the page was opened from an invite link. We emit on the
-      // local `newSocket` (guaranteed live here) rather than the `socket` state,
-      // which may still be null on first render. The ref guard ensures we only
-      // emit once even if StrictMode runs this effect twice in dev.
-      if (initialRoomCode && !joinedViaLinkRef.current) {
+      if (roomCodeRef.current && playerSymbolRef.current) {
+        // This is a RECONNECT after a dropped connection mid-game. Re-claim our
+        // seat so the server swaps in the new socket id and cancels the room's
+        // pending deletion.
+        newSocket.emit('rejoinRoom', {
+          roomCode: roomCodeRef.current,
+          playerSymbol: playerSymbolRef.current,
+        });
+      } else if (initialRoomCode && !joinedViaLinkRef.current) {
+        // First connect from an invite link: auto-join. We emit on the local
+        // `newSocket` (guaranteed live here) rather than the `socket` state,
+        // which may still be null. The ref guard makes it fire exactly once
+        // even if StrictMode runs this effect twice in dev.
         joinedViaLinkRef.current = true;
         newSocket.emit('joinRoom', initialRoomCode);
       }
     });
 
-    newSocket.on('roomCreated', ({ roomCode, playerSymbol, playerId }) => {
+    newSocket.on('roomCreated', ({ roomCode, playerSymbol, playerId, gameType }) => {
       setRoomCode(roomCode);
       setPlayerSymbol(playerSymbol);
       setPlayerId(playerId);
+      roomCodeRef.current = roomCode;
+      playerSymbolRef.current = playerSymbol;
+      if (gameType) setGameType(gameType);
       setWaitingForOpponent(true);
       setShowNamePrompt(true);
       setError('');
     });
 
-    newSocket.on('roomJoined', ({ roomCode, playerSymbol, playerId }) => {
+    newSocket.on('roomJoined', ({ roomCode, playerSymbol, playerId, gameType }) => {
       setRoomCode(roomCode);
       setPlayerSymbol(playerSymbol);
       setPlayerId(playerId);
+      roomCodeRef.current = roomCode;
+      playerSymbolRef.current = playerSymbol;
+      if (gameType) setGameType(gameType);
       setShowNamePrompt(true);
       setError('');
 
@@ -79,8 +109,9 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
       }
     });
 
-    newSocket.on('gameStart', ({ squares, xIsNext }) => {
+    newSocket.on('gameStart', ({ squares, xIsNext, gameType }) => {
       gameStartedRef.current = true;
+      if (gameType) setGameType(gameType);
       setGameStarted(true);
       setWaitingForOpponent(false);
       setSquares(squares);
@@ -98,6 +129,11 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
     newSocket.on('opponentDisconnected', () => {
       setOpponentConnected(false);
       setError('Opponent disconnected');
+    });
+
+    newSocket.on('opponentReconnected', () => {
+      setOpponentConnected(true);
+      setError('');
     });
 
     newSocket.on('error', (message) => {
@@ -122,7 +158,7 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
 
   const createRoom = () => {
     if (socket) {
-      socket.emit('createRoom');
+      socket.emit('createRoom', { gameType });
     }
   };
 
@@ -196,6 +232,12 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
 
   const isMyTurn = (xIsNext && playerSymbol === 'X') || (!xIsNext && playerSymbol === 'O');
 
+  // The server still tracks players as 'X' and 'O'. In Connect 4 we surface
+  // those as the red and yellow discs instead.
+  const symbolLabel = (sym) =>
+    gameType === 'connect4' ? (sym === 'X' ? '🔴 Red' : '🟡 Yellow') : sym;
+  const opponentSymbol = playerSymbol === 'X' ? 'O' : 'X';
+
   // Invite-link failure view — shown when someone follows a link to a room that
   // is full or no longer exists. Takes priority over the lobby so they never see
   // the Create/Join UI they didn't ask for.
@@ -228,7 +270,7 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
         </button>
         <div className="lobby">
           <div className="lobby-header">
-            <h1>Multiplayer Tic Tac Toe</h1>
+            <h1>Multiplayer {GAME_LABELS[gameType] || 'Game'}</h1>
           </div>
 
           <div className="lobby-section">
@@ -295,7 +337,7 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
       </button>
 
       <div className="game-header">
-        <h1>Multiplayer Game</h1>
+        <h1>Multiplayer {GAME_LABELS[gameType] || 'Game'}</h1>
         <div className="room-info">
           <div className="room-code-display">
             <span className="room-label">Room Code:</span>
@@ -305,7 +347,7 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
             </button>
           </div>
           <div className="player-info">
-            You are: <strong>{playerSymbol}</strong>
+            You are: <strong>{symbolLabel(playerSymbol)}</strong>
           </div>
         </div>
       </div>
@@ -327,12 +369,12 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
       {playerName && (
         <div className="player-names">
           <div className="player-name-item">
-            <span className="name-label">You ({playerSymbol}):</span>
+            <span className="name-label">You ({symbolLabel(playerSymbol)}):</span>
             <span className="name-value">{playerName}</span>
           </div>
           {opponentName && (
             <div className="player-name-item">
-              <span className="name-label">Opponent ({playerSymbol === 'X' ? 'O' : 'X'}):</span>
+              <span className="name-label">Opponent ({symbolLabel(opponentSymbol)}):</span>
               <span className="name-value">{opponentName}</span>
             </div>
           )}
@@ -366,15 +408,27 @@ export default function MultiplayerGame({ onBackToMenu, initialRoomCode = '' }) 
             )}
           </div>
           <div className="game-board">
-            <Board
-              xIsNext={xIsNext}
-              squares={squares}
-              onPlay={handlePlay}
-              playerX={playerSymbol === 'X' ? playerName : opponentName}
-              playerO={playerSymbol === 'O' ? playerName : opponentName}
-              onGameEnd={handleGameEnd}
-              currentPlayerSymbol={playerSymbol}
-            />
+            {gameType === 'connect4' ? (
+              <Connect4Board
+                xIsNext={xIsNext}
+                squares={squares}
+                onPlay={handlePlay}
+                playerX={playerSymbol === 'X' ? playerName : opponentName}
+                playerO={playerSymbol === 'O' ? playerName : opponentName}
+                onGameEnd={handleGameEnd}
+                currentPlayerSymbol={playerSymbol}
+              />
+            ) : (
+              <Board
+                xIsNext={xIsNext}
+                squares={squares}
+                onPlay={handlePlay}
+                playerX={playerSymbol === 'X' ? playerName : opponentName}
+                playerO={playerSymbol === 'O' ? playerName : opponentName}
+                onGameEnd={handleGameEnd}
+                currentPlayerSymbol={playerSymbol}
+              />
+            )}
             <button className="reset-button" onClick={handleReset}>
               New Game
             </button>

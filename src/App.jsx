@@ -13,6 +13,9 @@ export default function App() {
   });
   // Invitees skip the menu entirely and drop straight into multiplayer.
   const [gameMode, setGameMode] = useState(initialRoomCode ? 'multiplayer' : 'menu'); // 'menu', 'local', 'multiplayer'
+  // Which game the player picked from the menu. Invite-link arrivals start as
+  // null — they learn the room's game type from the server instead.
+  const [selectedGameType, setSelectedGameType] = useState(initialRoomCode ? null : 'tictactoe');
   const [history, setHistory] = useState([Array(9).fill(null)]);
   const [currentMove, setCurrentMove] = useState(0);
   const xIsNext = currentMove % 2 === 0;
@@ -38,7 +41,8 @@ export default function App() {
     resetGame();
   }
 
-  function startMultiplayerGame() {
+  function selectGame(type) {
+    setSelectedGameType(type);
     setGameMode('multiplayer');
   }
 
@@ -47,18 +51,23 @@ export default function App() {
     resetGame();
   }
 
-  // Main menu
+  // Main menu — pick which game to play. Both games share the same online
+  // create/join/invite flow; only the board differs.
   if (gameMode === 'menu') {
     return (
       <div className="game menu">
         <div className="game-header">
-          <h1>Tic Tac Toe</h1>
-          <p className="subtitle">Choose your game mode</p>
+          <h1>Game Night</h1>
+          <p className="subtitle">Choose a game to play online</p>
         </div>
         <div className="menu-buttons">
-          <button className="menu-button multiplayer-button" onClick={startMultiplayerGame}>
-            🌐 Online Multiplayer
-            <span className="menu-button-desc">Play with a friend online</span>
+          <button className="menu-button multiplayer-button" onClick={() => selectGame('tictactoe')}>
+            ⭕ Tic Tac Toe
+            <span className="menu-button-desc">Classic 3-in-a-row</span>
+          </button>
+          <button className="menu-button connect4-button" onClick={() => selectGame('connect4')}>
+            🔴 Connect 4
+            <span className="menu-button-desc">Drop discs, get 4 in a row</span>
           </button>
         </div>
       </div>
@@ -67,7 +76,13 @@ export default function App() {
 
   // Multiplayer mode
   if (gameMode === 'multiplayer') {
-    return <MultiplayerGame onBackToMenu={backToMenu} initialRoomCode={initialRoomCode} />;
+    return (
+      <MultiplayerGame
+        onBackToMenu={backToMenu}
+        initialRoomCode={initialRoomCode}
+        initialGameType={selectedGameType}
+      />
+    );
   }
 
   // Local game mode

@@ -38,16 +38,23 @@ function generateRoomCode() {
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  socket.on('createRoom', () => {
+  socket.on('createRoom', (data) => {
     const roomCode = generateRoomCode();
+    // Each room remembers which game it hosts so it can size the board and tell
+    // joiners what to render. Defaults to tic-tac-toe for older clients that
+    // emit createRoom with no payload.
+    const gameType = data && data.gameType === 'connect4' ? 'connect4' : 'tictactoe';
+    const boardSize = gameType === 'connect4' ? 42 : 9; // 6x7 vs 3x3
     const gameState = {
       roomCode,
+      gameType,
       players: [socket.id],
       playerNames: {},
-      squares: Array(9).fill(null),
+      squares: Array(boardSize).fill(null),
       xIsNext: true,
-      history: [Array(9).fill(null)],
-      started: false
+      history: [Array(boardSize).fill(null)],
+      started: false,
+      deletionTimer: null // set when a player drops; cancelled if they return
     };
 
     games.set(roomCode, gameState);
@@ -56,10 +63,11 @@ io.on('connection', (socket) => {
     socket.emit('roomCreated', {
       roomCode,
       playerSymbol: 'X',
-      playerId: socket.id
+      playerId: socket.id,
+      gameType
     });
 
-    console.log(`Room created: ${roomCode}`);
+    console.log(`Room created: ${roomCode} (${gameType})`);
   });
 
   socket.on('joinRoom', (roomCode) => {
@@ -82,7 +90,8 @@ io.on('connection', (socket) => {
     socket.emit('roomJoined', {
       roomCode,
       playerSymbol: 'O',
-      playerId: socket.id
+      playerId: socket.id,
+      gameType: game.gameType
     });
 
     // Randomly determine who goes first
@@ -92,7 +101,8 @@ io.on('connection', (socket) => {
     io.to(roomCode).emit('gameStart', {
       players: game.players,
       squares: game.squares,
-      xIsNext: game.xIsNext
+      xIsNext: game.xIsNext,
+      gameType: game.gameType
     });
 
     console.log(`Player joined room: ${roomCode}`);
@@ -147,9 +157,10 @@ io.on('connection', (socket) => {
       return;
     }
 
-    game.squares = Array(9).fill(null);
+    const boardSize = game.gameType === 'connect4' ? 42 : 9;
+    game.squares = Array(boardSize).fill(null);
     game.xIsNext = Math.random() < 0.5; // Randomly determine who goes first
-    game.history = [Array(9).fill(null)];
+    game.history = [Array(boardSize).fill(null)];
 
     io.to(roomCode).emit('gameUpdate', {
       squares: game.squares,
@@ -183,17 +194,68 @@ io.on('connection', (socket) => {
     console.log(`Player ${socket.id} set name to ${name} in room ${roomCode}`);
   });
 
+  // A player whose socket dropped and reconnected re-claims their seat by room
+  // code + symbol. socket.io reconnects with a NEW socket id, so without this the
+  // old id lingers in game.players and the room's deletion timer fires mid-game.
+  socket.on('rejoinRoom', ({ roomCode, playerSymbol }) => {
+    const game = games.get(roomCode);
+    if (!game) {
+      socket.emit('error', 'Game not found');
+      return;
+    }
+
+    // They're back — cancel any pending deletion.
+    if (game.deletionTimer) {
+      clearTimeout(game.deletionTimer);
+      game.deletionTimer = null;
+    }
+
+    // Swap the new socket id into the right seat (slot 0 = 'X', slot 1 = 'O')
+    // and migrate the player's stored name from their old id.
+    const slot = playerSymbol === 'O' ? 1 : 0;
+    const oldId = game.players[slot];
+    if (oldId && oldId !== socket.id && game.playerNames[oldId]) {
+      game.playerNames[socket.id] = game.playerNames[oldId];
+      delete game.playerNames[oldId];
+    }
+    game.players[slot] = socket.id;
+    socket.join(roomCode);
+
+    // Re-sync this client to the authoritative state and clear the opponent's
+    // "disconnected" warning.
+    socket.emit('gameUpdate', {
+      squares: game.squares,
+      xIsNext: game.xIsNext,
+      history: game.history
+    });
+    socket.to(roomCode).emit('opponentReconnected');
+
+    // Restore name labels on both sides.
+    const opponentId = game.players.find((id) => id !== socket.id);
+    if (game.playerNames[socket.id]) {
+      socket.to(roomCode).emit('opponentName', game.playerNames[socket.id]);
+    }
+    if (opponentId && game.playerNames[opponentId]) {
+      socket.emit('opponentName', game.playerNames[opponentId]);
+    }
+
+    console.log(`Player ${socket.id} rejoined room ${roomCode} as ${playerSymbol}`);
+  });
+
   socket.on('disconnect', () => {
     console.log('User disconnected:', socket.id);
 
-    // Find and clean up games where this player was involved
+    // Find games where this player was involved
     for (const [roomCode, game] of games.entries()) {
       if (game.players.includes(socket.id)) {
-        // Notify other players
+        // Notify the opponent
         socket.to(roomCode).emit('opponentDisconnected');
 
-        // Remove game after a delay to allow reconnection
-        setTimeout(() => {
+        // Schedule deletion, but keep a handle so a reconnect (rejoinRoom) can
+        // cancel it. Without the handle the room is deleted 30s later even if
+        // the player comes right back.
+        if (game.deletionTimer) clearTimeout(game.deletionTimer);
+        game.deletionTimer = setTimeout(() => {
           games.delete(roomCode);
           console.log(`Room deleted: ${roomCode}`);
         }, 30000); // 30 seconds grace period
@@ -204,6 +266,13 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3001;
 
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Socket.IO server running on port ${PORT}`);
-});
+// Only start listening when run directly (node server.js). When the test suite
+// imports this file, it starts the server itself on an ephemeral port.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) {
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Socket.IO server running on port ${PORT}`);
+  });
+}
+
+export { app, httpServer, io, games };
